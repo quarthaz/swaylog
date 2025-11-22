@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>swaylog — simple habit tracker</title>
+  <style>
+    :root{font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#0f172a}
+    body{max-width:980px;margin:18px auto;padding:18px}
+    h1{margin:0 0 8px;font-size:20px}
+    .card{border:1px solid #e6eef6;padding:14px;border-radius:12px;margin-bottom:12px;box-shadow:0 1px 2px rgba(2,6,23,0.04)}
+    label{display:block;margin-bottom:6px;font-weight:600}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .col{flex:1;min-width:220px}
+    input[type=range]{width:100%}
+    .small{font-size:13px;color:#334155}
+    button{background:#0b72ff;color:white;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+    button.secondary{background:#eef2ff;color:#0b3b99}
+    table{width:100%;border-collapse:collapse;margin-top:10px}
+    th,td{padding:6px 8px;border-bottom:1px solid #f3f6fb;text-align:left;font-size:13px}
+    canvas{max-width:100%;height:240px}
+    .corr{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+    .pill{background:#f1f5f9;padding:8px;border-radius:8px;font-weight:600}
+    .muted{color:#64748b;font-size:13px}
+    @media (max-width:520px){.row{flex-direction:column}}
+  </style>
+</head>
+<body>
+  <h1>swaylog — quick habit tracker</h1>
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <label for="date">Date</label>
+        <input id="date" type="date" />
+      </div>
+      <div class="col">
+        <label for="sleep">Sleep (0–10) <span id="val-sleep" class="small">5</span></label>
+        <input id="sleep" type="range" min="0" max="10" step="1" value="5" />
+      </div>
+      <div class="col">
+        <label for="food">Food (0–10) <span id="val-food" class="small">5</span></label>
+        <input id="food" type="range" min="0" max="10" step="1" value="5" />
+      </div>
+      <div class="col">
+        <label for="exercise">Exercise (0–10) <span id="val-exercise" class="small">5</span></label>
+        <input id="exercise" type="range" min="0" max="10" step="1" value="5" />
+      </div>
+      <div class="col">
+        <label for="mood">How you felt yesterday (0–10) <span id="val-mood" class="small">5</span></label>
+        <input id="mood" type="range" min="0" max="10" step="1" value="5" />
+      </div>
+    </div>
+
+    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+      <button id="save">Save entry</button>
+      <button class="secondary" id="export">Export CSV</button>
+      <button class="secondary" id="clear">Clear all</button>
+      <div style="margin-left:auto;align-self:center" class="muted">Data stored locally on your phone in the browser.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 8px">History</h3>
+    <canvas id="chart"></canvas>
+    <div class="corr" id="corr"></div>
+    <div id="table-wrap"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    // --- helpers
+    const qs = s => document.querySelector(s)
+    const dateInput = qs('#date')
+    const sleep = qs('#sleep'), food = qs('#food'), exercise = qs('#exercise'), mood = qs('#mood')
+    const vs = {sleep:qs('#val-sleep'),food:qs('#val-food'),exercise:qs('#val-exercise'),mood:qs('#val-mood')}
+
+    // default date = today
+    const todayISO = (new Date()).toISOString().slice(0,10)
+    dateInput.value = todayISO
+
+    ;[sleep,food,exercise,mood].forEach(el=>{
+      el.addEventListener('input',()=>{ vs[el.id].innerText = el.value })
+    })
+
+    const STORAGE_KEY = 'swaylog.entries.v1'
+    function load(){
+      try{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]') }
+      catch(e){ return [] }
+    }
+    function saveAll(arr){ localStorage.setItem(STORAGE_KEY, JSON.stringify(arr)) }
+
+    // add or replace entry for date
+    function saveEntry(obj){
+      const all = load().filter(x=>x.date!==obj.date)
+      all.push(obj)
+      all.sort((a,b)=>a.date.localeCompare(b.date))
+      saveAll(all)
+      return all
+    }
+
+    function deleteAll(){ localStorage.removeItem(STORAGE_KEY) }
+
+    // CSV export
+    function toCSV(rows){
+      const header = ['date','sleep','food','exercise','mood']
+      const lines = [header.join(',')].concat(rows.map(r=>[r.date,r.sleep,r.food,r.exercise,r.mood].join(',')))
+      return lines.join('\n')
+    }
+
+    // correlation (Pearson) — returns null if n<2 or zero variance
+    function pearson(x,y){
+      const n = x.length
+      if(n<2) return null
+      const mean = arr=>arr.reduce((a,b)=>a+b,0)/arr.length
+      const mx = mean(x), my = mean(y)
+      let num=0, sx=0, sy=0
+      for(let i=0;i<n;i++){ num += (x[i]-mx)*(y[i]-my); sx += (x[i]-mx)**2; sy += (y[i]-my)**2 }
+      const denom = Math.sqrt(sx*sy)
+      if(denom===0) return null
+      return num/denom
+    }
+
+    // small UI update functions
+    let chart=null
+    function render(){
+      const rows = load()
+      // table
+      const wrap = qs('#table-wrap')
+      if(rows.length===0){ wrap.innerHTML = '<div class="muted">No entries yet.</div>'; updateChart([]); updateCorr([]); return }
+      let html = '<table><thead><tr><th>Date</th><th>Sleep</th><th>Food</th><th>Exercise</th><th>Mood</th></tr></thead><tbody>'
+      rows.forEach(r=>{ html += `<tr><td>${r.date}</td><td>${r.sleep}</td><td>${r.food}</td><td>${r.exercise}</td><td>${r.mood}</td></tr>` })
+      html += '</tbody></table>'
+      wrap.innerHTML = html
+
+      updateChart(rows)
+      updateCorr(rows)
+    }
+
+    function updateChart(rows){
+      const labels = rows.map(r=>r.date)
+      const ds = (k)=>rows.map(r=>+r[k])
+      const data = {labels, datasets:[
+        {label:'Sleep',data:ds('sleep'),fill:false,tension:0.2},
+        {label:'Food',data:ds('food'),fill:false,tension:0.2},
+        {label:'Exercise',data:ds('exercise'),fill:false,tension:0.2},
+        {label:'Mood',data:ds('mood'),fill:true,tension:0.2}
+      ]}
+
+      if(chart){ chart.data = data; chart.update(); return }
+      const ctx = qs('#chart').getContext('2d')
+      chart = new Chart(ctx,{type:'line',data,options:{interaction:{mode:'index',intersect:false},scales:{y:{min:0,max:10}}}})
+    }
+
+    function updateCorr(rows){
+      const el = qs('#corr'); el.innerHTML = ''
+      if(rows.length<2){ el.innerHTML = '<div class="muted">Add more entries (≥2) to see correlations.</div>'; return }
+      const moodArr = rows.map(r=>+r.mood)
+      const sleepArr = rows.map(r=>+r.sleep)
+      const foodArr = rows.map(r=>+r.food)
+      const exArr = rows.map(r=>+r.exercise)
+      const cs = [ ['Sleep', pearson(sleepArr,moodArr)], ['Food', pearson(foodArr,moodArr)], ['Exercise', pearson(exArr,moodArr)] ]
+      cs.forEach(([name,val])=>{
+        const v = (val===null)?'—':(Math.round(val*100)/100).toFixed(2)
+        const p = document.createElement('div'); p.className='pill'; p.innerText = `${name}: ${v}`; el.appendChild(p)
+      })
+      const expl = document.createElement('div'); expl.className='muted'; expl.style.width='100%'; expl.innerText = 'Pearson correlation with mood. 1 = strong positive, -1 = strong negative. Interpret cautiously.'; el.appendChild(expl)
+    }
+
+    // wire buttons
+    qs('#save').addEventListener('click',()=>{
+      const item = { date:dateInput.value, sleep:+sleep.value, food:+food.value, exercise:+exercise.value, mood:+mood.value }
+      if(!item.date){ alert('Pick a date'); return }
+      const all = saveEntry(item)
+      render()
+      // tiny feedback
+      qs('#save').innerText = 'Saved ✓'
+      setTimeout(()=>qs('#save').innerText='Save entry',900)
+    })
+
+    qs('#export').addEventListener('click',()=>{
+      const rows = load(); if(rows.length===0){ alert('No entries'); return }
+      const csv = toCSV(rows)
+      const blob = new Blob([csv],{type:'text/csv'})
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a'); a.href=url; a.download = `swaylog-${(new Date()).toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(url)
+    })
+
+    qs('#clear').addEventListener('click',()=>{
+      if(!confirm('Delete all entries?')) return
+      deleteAll(); render()
+    })
+
+    // init
+    render()
+  </script>
+</body>
+</html>
